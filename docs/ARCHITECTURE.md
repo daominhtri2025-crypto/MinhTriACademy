@@ -121,19 +121,28 @@ Preconditions: user đã đăng nhập + email_verified = true
      expires_at < now()     → UPDATE status='expired' → 410
      bound_email ≠ NULL AND bound_email ≠ user.email → 403
        (log audit 'code.redeem_email_mismatch'; phản hồi ra ngoài vẫn là thông báo chung)
-     đã có enrollment (user, course) → 409
-5. UPDATE activation_codes SET status='used', redeemed_by=$user, redeemed_at=now();
-   INSERT INTO enrollments (user_id, course_id, code_id, expires_at, price_paid_vnd) ...;
+     kind='extension' mà chưa có enrollment → 409 NO_ENROLLMENT_TO_EXTEND
+     enrollment đang vĩnh viễn (expires_at IS NULL) → 409 ALREADY_LIFETIME (không đốt mã)
+5. SELECT grant_access($user, $course, 'code', $code_id);              -- migration 002
+   -- cùng transaction: đánh dấu mã 'used'; tạo enrollment lần đầu HOẶC gia hạn (cộng từ max(now, expires_at));
+   -- ghi sổ cái enrollment_grants; progress/submissions giữ nguyên (enrollments là 1 hàng / (user, course)).
 6. COMMIT; invalidate cache quyền truy cập khóa học.
 ```
 
-**Quyết định về ràng buộc 1-1:** nếu admin gắn sẵn email → bắt buộc khớp. Nếu không gắn sẵn → mã *bind vào tài khoản đầu tiên redeem* (`redeemed_by`) và không thể dùng lại. Cả hai đều đảm bảo 1 mã ↔ 1 tài khoản ↔ 1 enrollment (ràng buộc UNIQUE ở DB).
+**Quyết định về ràng buộc 1-1:** nếu admin gắn sẵn email → bắt buộc khớp. Nếu không gắn sẵn → mã *bind vào tài khoản đầu tiên redeem* (`redeemed_by`) và không thể dùng lại. Ràng buộc `UNIQUE(code_id)` nay nằm ở `enrollment_grants`: 1 mã ↔ 1 lần cấp quyền; `enrollments` giữ `UNIQUE(user_id, course_id)` nên mỗi học viên vẫn chỉ có một enrollment mỗi khóa, và gia hạn không làm mất tiến độ. Tài khoản do phụ huynh quản lý (`users.is_managed`) đối chiếu `bound_email` với email của người giám hộ. Các quy tắc đầy đủ: [`DECISIONS.md`](DECISIONS.md) (ADR-002, ADR-003).
+
+**Cấp thủ công (admin):** `grant_access(..., 'admin_grant', p_admin => ...)` — dùng cho học viên đóng học phí trực tiếp tại trung tâm; bắt buộc ghi `granted_by` và `audit_logs`.
 
 **Phản hồi thống nhất:** các trường hợp "không tồn tại / sai email" trả cùng thông điệp để không cho kẻ tấn công dò trạng thái mã (enumeration oracle). Lý do thật được ghi vào `audit_logs` cho admin.
 
 ### 2.4 Kiểm soát truy cập nội dung
 
-Mỗi request nội dung kiểm tra `enrollment.status='active' AND (expires_at IS NULL OR expires_at > now())` bằng Guard, cache Redis TTL ngắn. Video dùng **signed URL TTL 5–10 phút**, gắn `session_id`. Lời giải (`solution_md`) **không nằm trong payload bài học**; chỉ trả qua `GET /exercises/:id/solution` khi thỏa chính sách (ví dụ đã nộp ≥ 1 lần hoặc đã bấm xem gợi ý) — Accordion ở UI chỉ là lớp hiển thị, không phải lớp bảo mật.
+Mỗi request nội dung kiểm tra bằng Guard (tham chiếu `can_access_lesson`): `enrollment.status='active' AND (expires_at IS NULL OR expires_at > now())`, **hoặc** chương có `is_free_preview` và người dùng đã đăng nhập + xác minh email (học thử Chương 1 của Scratch và Python). Cache Redis TTL ngắn, xóa chủ động khi thu hồi/hết hạn. Video dùng **signed URL TTL 5–10 phút**, gắn `session_id`.
+
+Gợi ý và lời giải **không nằm trong payload bài học**:
+- `POST /exercises/:id/hints/:level` (level 1→3, tuần tự, không phạt EXP) — hàm `open_hint`.
+- `GET /exercises/:id/solution` — hàm `view_solution`: mở khi ≥ 3 lần nộp sai (mã nguồn khác nhau) **hoặc** ≥ 10 phút làm bài tích lũy (heartbeat), **hoặc** đã đạt. Xem lời giải *trước khi đạt* → EXP bài học còn 50% (`lesson_exp_award`).
+- Accordion ở UI chỉ là lớp hiển thị, không phải lớp bảo mật.
 
 ### 2.5 Chống chia sẻ tài khoản — **[Quyết định]** mức "code↔email + giới hạn phiên/thiết bị"
 
@@ -141,7 +150,9 @@ Mỗi request nội dung kiểm tra `enrollment.status='active' AND (expires_at 
 
 | Cơ chế | Chi tiết |
 |---|---|
-| **Giới hạn thiết bị** | Tối đa **3 thiết bị** đã đăng ký/tài khoản (`user_devices`). Thiết bị = cookie ngẫu nhiên httpOnly, **không dùng fingerprint** (tránh rủi ro riêng tư, đặc biệt với trẻ em). Vượt giới hạn → buộc thu hồi thiết bị cũ qua trang quản lý thiết bị (xác thực email OTP). |
+| **Giới hạn thiết bị** | Mặc định **3 thiết bị**/tài khoản (`users.device_quota`, admin có thể nâng tới 5 cho trường hợp đặc biệt). Thiết bị = cookie ngẫu nhiên httpOnly, **không dùng fingerprint** (tránh rủi ro riêng tư, đặc biệt với trẻ em). Vượt giới hạn → buộc thu hồi thiết bị cũ qua trang quản lý thiết bị (xác thực email OTP). **Máy kiosk của trung tâm** (`institution_devices`, do admin đăng ký, chỉ hợp lệ khi IP thuộc `trusted_networks`) không tính vào quota. |
+| **Trung tâm (IP/NAT)** | Dải IP của trung tâm được đánh dấu *Trusted Institution* (`trusted_networks`): nới rate limit theo IP (redeem, đăng nhập) để nhiều học viên dùng chung NAT. Chỉ áp dụng cho IP tĩnh độc quyền, không áp dụng cho CGNAT. Miễn quota thiết bị yêu cầu thêm yếu tố thứ hai là máy kiosk đã đăng ký. |
+| **Gia đình** | Mỗi bé có tài khoản riêng (`is_managed`, không cần email) liên kết với phụ huynh (`guardian_links`); phụ huynh chuyển hồ sơ sang con (`user_sessions.acting_guardian_id`). Tiến độ, EXP, phiên học và quota thiết bị tách theo từng bé. |
 | **1 phiên học đồng thời** | Client gửi heartbeat 30s vào Redis key `learn:{userId}`; phiên thứ hai vào học → phiên cũ nhận `409 SESSION_SUPERSEDED` và bị đẩy ra (`revoked_reason='new_session_kick'`). |
 | **Refresh-token rotation + reuse detection** | Mỗi lần refresh phát token mới, token cũ vô hiệu. Token cũ bị dùng lại ⇒ cả `family_id` bị thu hồi (dấu hiệu token bị sao chép). |
 | **Phát hiện bất thường** | Chấm điểm rủi ro: đổi quốc gia/ASN trong thời gian ngắn, > N thiết bị mới/tuần, nhiều IP khác dải. Vượt ngưỡng → yêu cầu OTP lại + cảnh báo admin (không khóa tự động). |
@@ -165,7 +176,7 @@ Mỗi request nội dung kiểm tra `enrollment.status='active' AND (expires_at 
 | Ngôn ngữ | Prototype (`web/app/ide`) | Production |
 |---|---|---|
 | Python | **Pyodide thực thi thật** trên trình duyệt (stdout/stderr) | Pyodide cho chạy thử; **chấm bài** luôn qua sandbox server |
-| Java / C++ | **Mock** có đánh dấu rõ ràng | Judge0/Piston qua BullMQ: `POST /submissions` → job → poll/WebSocket |
+| Java / C++ | **Mock** có đánh dấu rõ ràng | Sandbox tự vận hành (Piston/Judge0/runner `isolate`, chốt sau benchmark) qua BullMQ; xem [`GRADING_PIPELINE.md`](GRADING_PIPELINE.md) |
 | Scratch | Trình xem block giả lập (SVG tĩnh + "chạy" mô phỏng sprite) | `scratch-blocks` + `scratch-vm` |
 
 Luồng chấm: `Submit → INSERT submissions(pending) → BullMQ → Worker gọi sandbox với từng test_case → ghi result JSONB, score → cộng EXP (idempotent) → đánh giá badge rule`. Client **không bao giờ** là nguồn tin cậy cho điểm số.
@@ -175,6 +186,8 @@ Luồng chấm: `Submit → INSERT submissions(pending) → BullMQ → Worker g�
 ## 4. Điểm cần xác nhận
 
 1. **[Giả định]** Thanh toán diễn ra ngoài hệ thống (chuyển khoản → admin cấp mã). Nếu cần cổng thanh toán (VNPay/MoMo), thêm module `orders` và tự động sinh mã.
-2. **[Giả định]** `duration_days` mặc định `NULL` (truy cập vĩnh viễn) — cần chốt chính sách hết hạn.
-3. Chính sách mở **Lời giải**: sau ≥ 1 lần nộp, hay sau N lần sai? Prototype dùng "mở tự do" để minh họa UX.
-4. Hạn mức 3 thiết bị / 1 phiên đồng thời có phù hợp với gia đình có nhiều con học chung? Cân nhắc loại tài khoản "gia đình".
+2. **[Giả định]** `duration_days` mặc định `NULL` (truy cập vĩnh viễn) — cần chốt chính sách hết hạn. *Gia hạn* đã được hỗ trợ (ADR-002); khóa vĩnh viễn không gia hạn.
+3. ~~Chính sách mở Lời giải~~ → **Đã chốt** (ADR-001). Prototype `/ide`, `/learn` vẫn "mở tự do" để minh họa UX.
+4. ~~Hạn mức thiết bị cho gia đình~~ → **Đã chốt** (ADR-003): tài khoản riêng cho từng bé + liên kết phụ huynh.
+
+Các quyết định đã chốt và các điểm còn cần xác nhận: [`DECISIONS.md`](DECISIONS.md).
