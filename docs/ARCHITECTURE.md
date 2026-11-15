@@ -99,7 +99,9 @@ erDiagram
 
 ### 2.1 Định dạng mã
 
-`MTA-XXXX-XXXX-XXXX`: 12 ký tự Crockford Base32 (≈60 bit entropy) + 1 ký tự checksum. Chuẩn hóa (upper-case, bỏ dấu `-`, ánh xạ `O→0`, `I/L→1`) trước khi HMAC. Checksum giúp loại sớm lỗi gõ nhầm **mà không chạm DB** và không tính vào bộ đếm thất bại.
+`MTA-XXXX-XXXX-XXXX`: **11 ký tự dữ liệu + 1 ký tự kiểm tra = 12 ký tự** Crockford Base32 (bỏ I, L, O, U), ≈ **55 bit entropy**. *(Bản trước ghi "12 ký tự + 1 checksum ≈ 60 bit", không khớp định dạng hiển thị 12 ký tự; đã sửa theo định dạng. Brute-force trực tuyến vẫn không khả thi: với 10⁶ mã hợp lệ, xác suất một lần đoán trúng ≈ 3·10⁻¹¹.)* Chuẩn hóa (upper-case, bỏ khoảng trắng và dấu `-`, bỏ tiền tố `MTA`, ánh xạ `O→0`, `I/L→1`) trước khi HMAC.
+
+Ký tự kiểm tra dùng **Luhn mod 32**: phát hiện 100% lỗi sai một ký tự (đã kiểm chứng vét cạn trong unit test) và hầu hết lỗi đảo hai ký tự liền kề (> 95%, không phải 100%). Sai checksum → 422, **không chạm DB và không tính vào bộ đếm thất bại**. Mã gắn với `hmac_key_id` để xoay pepper (cấu hình `ACTIVATION_PEPPERS="id:hex,…"`, khóa đầu là khóa hiện hành; khóa cũ giữ lại cho tới khi hết mã cũ).
 
 ### 2.2 Sinh mã (Admin)
 
@@ -107,33 +109,37 @@ erDiagram
 2. Server sinh mã bằng CSPRNG, tính `code_hmac`, insert `activation_codes` (`status='unused'`), ghi `audit_logs`.
 3. Trả file CSV chứa plaintext **một lần**. Không thể truy xuất lại.
 
-### 2.3 Kích hoạt mã (Student) — `POST /v1/activation/redeem`
+### 2.3 Kích hoạt mã (Student) — `POST /v1/activate`
+
+*(Đã hiện thực tại `api/src/activation/`; đường dẫn đổi từ `/activation/redeem` thành `/activate`.)*
 
 ```text
-Preconditions: user đã đăng nhập + email_verified = true
-1. Rate limit (Redis): 5 lần/15’/user và 20 lần/giờ/IP → 429
-2. Validate checksum; sai → 422 (không tính vào bộ đếm)
+Preconditions: đã đăng nhập (JWT); email_verified = true (tài khoản trẻ em do phụ huynh quản lý: đối chiếu email phụ huynh)
+1. Rate limit (Redis, cửa sổ trượt) — chỉ đếm lần THẤT BẠI, kiểm tra TRƯỚC khi xử lý:
+     theo user: 5 thất bại / 15’     theo IP: 100 thất bại / giờ (IP thuộc mạng tin cậy của trung tâm: ×10)
+     vượt ngưỡng → 429 + Retry-After, kể cả khi mã đúng (mã không bị tiêu hao)
+2. Chuẩn hóa + kiểm tra checksum; sai → 422 CODE_FORMAT_INVALID (không chạm DB, không tính bộ đếm)
 3. BEGIN;
-   SELECT * FROM activation_codes WHERE code_hmac = $1 FOR UPDATE;   -- khóa hàng, chống race
-4. Kiểm tra theo thứ tự:
-     không tồn tại          → tăng bộ đếm thất bại (Redis) → 404 (thông báo chung "Mã không hợp lệ")
-     status ≠ 'unused'      → 409  (used/revoked/expired)
-     expires_at < now()     → UPDATE status='expired' → 410
-     bound_email ≠ NULL AND bound_email ≠ user.email → 403
-       (log audit 'code.redeem_email_mismatch'; phản hồi ra ngoài vẫn là thông báo chung)
-     kind='extension' mà chưa có enrollment → 409 NO_ENROLLMENT_TO_EXTEND
-     enrollment đang vĩnh viễn (expires_at IS NULL) → 409 ALREADY_LIFETIME (không đốt mã)
-5. SELECT grant_access($user, $course, 'code', $code_id);              -- migration 002
+   SELECT … FROM activation_codes WHERE code_hmac = ANY($hmac_của_mọi_pepper) FOR UPDATE;   -- khóa hàng, chống race
+4. Kiểm tra:
+     đã dùng bởi CHÍNH user này           → 409 ALREADY_REDEEMED_BY_YOU (không tính bộ đếm)
+     không tồn tại / đã dùng bởi người khác / bị thu hồi / hết hạn (ghi status='expired', COMMIT)
+       / bound_email không khớp           → bộ đếm thất bại +1 → 404 CODE_INVALID (CÙNG status & body cho mọi lý do)
+5. SAVEPOINT; SELECT grant_access($user, $course, 'code', $code_id);              -- migration 002
    -- cùng transaction: đánh dấu mã 'used'; tạo enrollment lần đầu HOẶC gia hạn (cộng từ max(now, expires_at));
    -- ghi sổ cái enrollment_grants; progress/submissions giữ nguyên (enrollments là 1 hàng / (user, course)).
-6. COMMIT; invalidate cache quyền truy cập khóa học.
+   -- Lỗi nghiệp vụ (sau khi mã & email đã hợp lệ, KHÔNG đốt mã, KHÔNG tính bộ đếm):
+   --   NO_ENROLLMENT_TO_EXTEND (mã gia hạn nhưng chưa có khóa) → 409;  ALREADY_LIFETIME (khóa vĩnh viễn) → 409
+6. COMMIT; xóa cache quyền truy cập khóa học; ghi audit 'code.redeem' (không bao giờ chứa mã).
 ```
+
+Hai tính chất được kiểm chứng bằng test tích hợp trên PostgreSQL/Redis thật: (a) hai người cùng dùng một mã → đúng một người thắng; (b) một người dùng hai mã của cùng khóa đồng thời → một enrollment, hai lần cấp (lần sau là gia hạn).
 
 **Quyết định về ràng buộc 1-1:** nếu admin gắn sẵn email → bắt buộc khớp. Nếu không gắn sẵn → mã *bind vào tài khoản đầu tiên redeem* (`redeemed_by`) và không thể dùng lại. Ràng buộc `UNIQUE(code_id)` nay nằm ở `enrollment_grants`: 1 mã ↔ 1 lần cấp quyền; `enrollments` giữ `UNIQUE(user_id, course_id)` nên mỗi học viên vẫn chỉ có một enrollment mỗi khóa, và gia hạn không làm mất tiến độ. Tài khoản do phụ huynh quản lý (`users.is_managed`) đối chiếu `bound_email` với email của người giám hộ. Các quy tắc đầy đủ: [`DECISIONS.md`](DECISIONS.md) (ADR-002, ADR-003).
 
 **Cấp thủ công (admin):** `grant_access(..., 'admin_grant', p_admin => ...)` — dùng cho học viên đóng học phí trực tiếp tại trung tâm; bắt buộc ghi `granted_by` và `audit_logs`.
 
-**Phản hồi thống nhất:** các trường hợp "không tồn tại / sai email" trả cùng thông điệp để không cho kẻ tấn công dò trạng thái mã (enumeration oracle). Lý do thật được ghi vào `audit_logs` cho admin.
+**Phản hồi thống nhất:** *mọi* lý do thất bại liên quan tới mã (không tồn tại, sai email, đã dùng bởi người khác, bị thu hồi, hết hạn) trả cùng một mã HTTP 404 và cùng nội dung — sửa bất nhất của bản trước vốn liệt kê 404/403/409/410 khác nhau, tạo oracle dò trạng thái mã. Lý do thật chỉ nằm trong `audit_logs`. Ngoại lệ có chủ đích: người dùng dùng lại mã *của chính mình* nhận 409 riêng (không lộ thông tin về người khác).
 
 ### 2.4 Kiểm soát truy cập nội dung
 
